@@ -27,6 +27,9 @@
 #include <mutex>
 #include <condition_variable>
 
+// 커스텀 ndt
+#include "ndt.h"
+
 
 
 // 가우시안 셀 구조체
@@ -55,7 +58,6 @@ public:
     // 스레드함수
     void NDTProcessingThread();
     
-
     void setInputTarget(const std::vector<pcl::PointXYZ>& target_points);
     void setInputTarget(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void setInputSource(const std::vector<pcl::PointXYZ>& source_points);
@@ -63,41 +65,10 @@ public:
 
 
     void buildTargetCells();
-    //float computeScoreAndGradient(const Eigen::Matrix4f& transformation, Eigen::VectorXf& gradient);
-    double trialValueSelectionMT(double a_l, double f_l, double g_l, double a_u, double f_u,
-                                    double g_u, double a_t, double f_t, double g_t) const;
-    bool updateIntervalMT(double& a_l, double& f_l, double& g_l, double& a_u,
-                            double& f_u, double& g_u, double a_t, double f_t, double g_t) const;
 
-    void computeHessian(Eigen::Matrix<double, 6, 6>& hessian, 
-                                    const pcl::PointCloud<pcl::PointXYZ>& trans_cloud);
-    void computeAngleDerivatives(const Eigen::Matrix<double, 6, 1>& transform, bool compute_hessian = true);
-    void updateHessian(Eigen::Matrix<double, 6, 6>& hessian,
-                                 const Eigen::Vector3d& x_trans,
-                                 const Eigen::Matrix3d& c_inv) const;
-    double updateDerivatives(Eigen::Matrix<double, 6, 1>& score_gradient,
-                                Eigen::Matrix<double, 6, 6>& hessian,
-                                const Eigen::Vector3d& x_trans,
-                                const Eigen::Matrix3d& c_inv,
-                                bool compute_hessian = true) const ;
-    void computePointDerivatives(const Eigen::Vector3d& x, bool compute_hessian);
-    double computeDerivatives(Eigen::Matrix<double, 6, 1>& score_gradient,
-                                        Eigen::Matrix<double, 6, 6>& hessian,
-                                        const pcl::PointCloud<pcl::PointXYZ>& trans_cloud,
-                                        const Eigen::Matrix<double, 6, 1>& transform,
-                                        bool compute_hessian); 
-    double computeStepLengthMT(const Eigen::Matrix<double, 6, 1>& x,
-                                        Eigen::Matrix<double, 6, 1>& step_dir,
-                                        double step_init,
-                                        double step_max,
-                                        double step_min,
-                                        double& score,
-                                        Eigen::Matrix<double, 6, 1>& score_gradient,
-                                        Eigen::Matrix<double, 6, 6>& hessian,
-                                        pcl::PointCloud<pcl::PointXYZ>& trans_cloud);
-    void align(Eigen::Matrix4d& m_matrix4d_initial_esti, pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_input_cloud);
-    std::vector<pcl::PointXYZ> convertToPointVector(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void startNDTThread();
+
+    std::vector<pcl::PointXYZ> convertToPointVector(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
 
     // 정규화 상수 계산 함수
     void computeNormalizationConstants();
@@ -109,6 +80,10 @@ public:
     
     
 private:
+
+    //라이브러리 선언
+    pcl::custom::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> m_ndt;
+
     // 숫자 추출 함수(맵불러올때)
     int extract_number(const std::string& i_file_path);
     // 포즈 데이터를 로드하는 함수
@@ -118,12 +93,6 @@ private:
     // 캘리브레이션 데이터를 로드하는 함수
     std::tuple<std::array<std::array<float, 4>, 4>, std::array<std::array<float, 4>, 4>> load_calibration(
                                                                                         const std::string& calib_file_name);
-
-    // void setTransformationEpsilon(const float& m_cfg_f_trans_error_allow);
-    // void setStepSize(const float& m_cfg_f_step_size_m); // 5.0
-    // void setResolution(const float& m_cfg_f_grid_size_m); // 2.0, 1.8
-    // void setMaximumIterations(const float& m_cfg_int_iterate_max); //30
-
 
 
 public:
@@ -141,8 +110,7 @@ public:
     int m_cfg_int_iterate_max;
     double m_cfg_d_gauss_k2;
     double m_cfg_d_gauss_k1;
-    double trans_likelihood_;
-    Eigen::Affine3d transformation_;
+
     int ndt_iter;
     int m_pose_num;
 
@@ -153,8 +121,6 @@ public:
     std::vector<pcl::PointXYZ> inputed_target_points;
     std::vector<pcl::PointXYZ> inputed_source_points;
 
-    Eigen::Matrix<double, 6, 6> m_cfg_mat6_d_hessian;
-    Eigen::Matrix<double, 6, 1> m_cfg_mat61_d_score_grad;
 
     //백그라운드 ndt실행
     std::queue<sensor_msgs::PointCloud2ConstPtr> m_lidar_data_queue;
@@ -163,12 +129,6 @@ public:
     std::thread m_ndt_thread;
     bool m_is_running;
     bool m_cfg_b_debug_mode;
-
-    double f_l;
-    double g_l;
-    double f_u;
-    double g_u;
-    double output;
 
 
 private:
@@ -184,10 +144,6 @@ private:
 
     std::vector<GaussianCell> m_vt_stGauCell_gaussian_cells;
 
-    Eigen::Matrix<double, 8, 4> angular_jacobian_;
-    Eigen::Matrix<double, 15, 4> angular_hessian_; 
-    Eigen::Matrix<double, 3, 6> point_jacobian_; 
-    Eigen::Matrix<double, 18, 6> point_hessian_;
 
     int nr_iterations_;                 // 반복 횟수
     bool converged_;                    // 수렴 여부
