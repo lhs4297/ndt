@@ -13,6 +13,9 @@
 #include <pcl/filters/crop_box.h>
 
 
+#include <pcl/kdtree/kdtree_flann.h> // KdTree를 사용하기 위해 추가
+#include <pcl/filters/voxel_grid.h>  // VoxelGrid 사용을 위한 헤더 추가
+#include <iterator>
 
 //백그라운드 ndt 실행
 #include <thread>
@@ -25,23 +28,37 @@
 
 // 클래스 생성
 LOCALIZATION::LOCALIZATION(ros::NodeHandle& nh) {
+
+    // 맵정보 불러옴
     std::string pcd_dir = "/home/ctu/LHS/approach/my_code/map_ws/src/result";
     m_pc_map_cloud = LoadPcdFile(pcd_dir);
 
+    // Pose정보 불러옴
+    std::string pose_file_name = "/home/ctu/LHS/approach/test_kitti/dataset/sequences/00/poses.txt";
+    std::string calib_file_name = "/home/ctu/LHS/approach/test_kitti/dataset/sequences/00/calib.txt";
+
+    // pose와 calibration 파일 로드
+    auto [Tr, Tr_inv] = load_calibration(calib_file_name);
+    m_vt_f_44_poses = load_poses(pose_file_name, Tr, Tr_inv);
+
+    // m_vt_f_44_poses의 x,y,z -> m_vt_f_44_poses[i번째 pose][row][cul];
+
 
     // NDT 파라미터 설정
-    m_cfg_f_trans_error_allow = 0.2; // 0.001
-    m_cfg_f_step_size_m = 1.0; // 5.0
-    m_cfg_f_grid_size_m = 1.5; // 2.0, 1.8
-    m_cfg_int_iterate_max = 100; //30
-    // 기타 멤버 변수
-    m_cfg_f_outlier_ratio = 0.55;
-    m_cfg_d_gauss_k1 = m_cfg_d_gauss_k2 = 0.0;
+    m_cfg_d_rot_error_allow = 0.01; // 0.001
+    m_cfg_d_trans_error_allow = 0.01;
+    m_cfg_f_step_size_m = 1.1; // 5.0
+    m_cfg_f_grid_size_m = 2.0; // 2.0, 1.8
+    m_cfg_int_iterate_max = 15; //30
 
     m_cfg_b_debug_mode = false;
+    converged_ = false;
+    outlier_ratio_ = 0.55;
+    final_transformation_ = Eigen::Matrix4d::Identity();
+    nr_iterations_ = 0;
+    ndt_iter = 0;
+    m_pose_num = 0;
 
-
-    computeNormalizationConstants();
 
     // NaN 값 확인 및 출력
     size_t nan_count = 0;
@@ -60,6 +77,7 @@ LOCALIZATION::LOCALIZATION(ros::NodeHandle& nh) {
 
     // 궤적 변수 초기화
     m_pc_trajectory_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
+    m_pc_predict_cloud.reset(new pcl::PointCloud<pcl::PointXYZ>());
 
     // 퍼블리셔 초기화
     m_ros_map_pub = nh.advertise<sensor_msgs::PointCloud2>("map_cloud", 1);
@@ -67,6 +85,7 @@ LOCALIZATION::LOCALIZATION(ros::NodeHandle& nh) {
     m_ros_trajectory_pub = nh.advertise<sensor_msgs::PointCloud2>("trajectory_cloud", 1);
     m_ros_filtered_map_pub = nh.advertise<sensor_msgs::PointCloud2>("filtered_map_cloud", 1);
     m_ros_filtered_input_pub = nh.advertise<sensor_msgs::PointCloud2>("filtered_input_cloud", 1);
+    m_ros_predict_pub = nh.advertise<sensor_msgs::PointCloud2>("predict_pose", 1);
 
     // 서브스크라이버 설정
     m_ros_point_cloud_sub = nh.subscribe("/kitti/velo/pointcloud", 1, &LOCALIZATION::NDTCallback, this);
@@ -78,9 +97,11 @@ LOCALIZATION::LOCALIZATION(ros::NodeHandle& nh) {
 
     // 초기 변환 행렬
     m_matrix4d_initial_esti = Eigen::Matrix4d::Identity(); // 클래스 멤버로 선언
+    m_matrix4d_prev = Eigen::Matrix4d::Identity();
     
     // 초기 source target
-    setInputTarget(LOCALIZATION::convertToPointVector(m_pc_map_cloud));
+    setInputTarget(convertToPointVector(m_pc_map_cloud));
+    pcl::PointCloud<pcl::PointXYZ>::Ptr inputed_source_points{new pcl::PointCloud<pcl::PointXYZ>()};
 
 }
 
@@ -113,6 +134,143 @@ std::vector<pcl::PointXYZ> LOCALIZATION::convertToPointVector(const pcl::PointCl
     return points;
 }
 
+// 4x4 행렬의 역행렬을 계산하는 함수
+std::array<std::array<float, 4>, 4> inverse(const std::array<std::array<float, 4>, 4>& matrix) {
+    Eigen::Matrix4f mat;
+    
+    // std::array를 Eigen::Matrix로 변환
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            mat(i, j) = matrix[i][j];
+        }
+    }
+    
+    // 역행렬 계산
+    Eigen::Matrix4f inv_mat = mat.inverse();
+    
+    // Eigen::Matrix를 std::array로 변환
+    std::array<std::array<float, 4>, 4> inv;
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            inv[i][j] = inv_mat(i, j);
+        }
+    }
+    
+    return inv;
+}
+
+// 행렬 곱셈 함수 추가 (4x4 행렬 곱셈)
+std::array<std::array<float, 4>, 4> matrix_multiply(const std::array<std::array<float, 4>, 4>& A, 
+                                                    const std::array<std::array<float, 4>, 4>& B) {
+    std::array<std::array<float, 4>, 4> result = {0};
+
+    #pragma omp parallel for
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            for (int k = 0; k < 4; ++k) {
+                result[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+
+    return result;
+}
+
+// 캘리브레이션 데이터를 로드하는 함수
+std::tuple<std::array<std::array<float, 4>, 4>, std::array<std::array<float, 4>, 4>> 
+LOCALIZATION::load_calibration(const std::string& calib_file_name) 
+{
+    std::vector<std::array<std::array<float, 4>, 4>> calibs;
+    std::ifstream infile(calib_file_name);
+    std::array<std::array<float, 4>, 4> Tr = {};
+    std::array<std::array<float, 4>, 4> Tr_inv = {};
+
+    std::string line;
+    while (std::getline(infile, line)) {
+        std::stringstream ss(line);
+        std::string key;
+        std::string content;
+
+        if (std::getline(ss, key, ':') && std::getline(ss, content)) {
+            std::stringstream content_ss(content);
+            std::vector<float> values;
+            float value;
+
+            while (content_ss >> value) {
+                values.push_back(value);
+            }
+
+            if (values.size() == 12) {
+                std::array<std::array<float, 4>, 4> calib;
+                calib[0] = { values[0], values[1], values[2], values[3] };
+                calib[1] = { values[4], values[5], values[6], values[7] };
+                calib[2] = { values[8], values[9], values[10], values[11] };
+                calib[3] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+                // Tr 캘리브레이션 매트릭스 찾기
+                if (key == "Tr") {
+                    Tr = calib;  // Tr 행렬 저장
+                    Tr_inv = inverse(Tr);
+                }
+
+                calibs.push_back(calib);
+            }
+        }
+    }
+
+    return std::make_tuple(Tr, Tr_inv);
+}
+
+// 포즈 데이터를 로드하는 함수
+std::vector<std::array<std::array<float, 4>, 4>> LOCALIZATION::load_poses(const std::string& pose_file_name,
+                                                                        const std::array<std::array<float, 4>, 4>& Tr,
+                                                                        const std::array<std::array<float, 4>, 4>& Tr_inv) 
+{
+    std::vector<std::array<std::array<float, 4>, 4>> poses;
+    std::ifstream infile(pose_file_name);
+    std::string line;
+    std::vector<std::array<std::array<float, 4>, 4>> calibrated_poses;
+
+
+    while (std::getline(infile, line)) {
+        std::istringstream iss(line);
+        std::array<float, 12> values;
+        for (int i = 0; i < 12; ++i) {
+            iss >> values[i];
+        }
+
+        std::array<std::array<float, 4>, 4> pose;
+        pose[0] = { values[0], values[1], values[2], values[3] };
+        pose[1] = { values[4], values[5], values[6], values[7] };
+        pose[2] = { values[8], values[9], values[10], values[11] };
+        pose[3] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+        poses.push_back(pose);
+
+        
+        std::array<std::array<float, 4>, 4> mat_mul_pose = matrix_multiply(Tr_inv, matrix_multiply(pose, Tr));
+
+        // std::array<std::array<float, 4>, 4> pose_queue;
+        // // 첫 번째 행 설정 (mat_mul_pose의 2번째 행)
+        // for (int i = 0; i < 4; ++i) {
+        //     pose_queue[0][i] = mat_mul_pose[2][i];
+        //     pose_queue[1][i] = mat_mul_pose[1][i];
+        //     pose_queue[2][i] = mat_mul_pose[0][i];
+        // }
+        // pose_queue[3] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+        // calibrated_poses.push_back(pose_queue);
+        calibrated_poses.push_back(mat_mul_pose);
+
+
+    }
+
+    
+
+    return calibrated_poses;
+}
+
+
 // 파일 이름에서 숫자 추출
 int LOCALIZATION::extract_number(const std::string& i_file_path) {
     size_t last_slash_idx = i_file_path.find_last_of("/\\");
@@ -136,7 +294,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr LOCALIZATION::LoadPcdFile(const std::string&
         }
     }
 
-    std::sort(file_lists.begin(), file_lists.end(),
+    std::sort(std::begin(file_lists), std::end(file_lists),
         [this](const std::string& a, const std::string& b) {
             return this->extract_number(a) < this->extract_number(b);
         });
@@ -161,15 +319,33 @@ void LOCALIZATION::setInputTarget(const std::vector<pcl::PointXYZ>& target_point
     inputed_target_points = target_points;
     buildTargetCells();
 }
+void LOCALIZATION::setInputTarget(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
+    // cloud를 std::vector<pcl::PointXYZ>로 변환하여 기존 함수 호출
+    setInputTarget(convertToPointVector(cloud)); 
+}
 
 void LOCALIZATION::setInputSource(const std::vector<pcl::PointXYZ>& source_points) {
     inputed_source_points = source_points;
+}
+void LOCALIZATION::setInputSource(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud) {
+    setInputSource(convertToPointVector(cloud)); // 기존 함수 호출
 }
 
 
 
 
 void LOCALIZATION::buildTargetCells() {
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr inputed_target_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    for (const auto& point : inputed_target_points) {
+        inputed_target_cloud->push_back(point);
+    }
+
+    // NaN 포인트 필터링
+    pcl::PointCloud<pcl::PointXYZ> filtered_target_points;
+    std::vector<int> indices;
+    pcl::removeNaNFromPointCloud(*inputed_target_cloud, filtered_target_points, indices);
+
     // 공간의 최소 및 최대 좌표 계산
     double d_min_x = std::numeric_limits<double>::max();
     double d_min_y = std::numeric_limits<double>::max();
@@ -178,7 +354,7 @@ void LOCALIZATION::buildTargetCells() {
     double d_max_y = std::numeric_limits<double>::lowest();
     double d_max_z = std::numeric_limits<double>::lowest();
 
-    for (const auto& point : inputed_target_points) {
+    for (const auto& point : filtered_target_points) {
         d_min_x = std::min(d_min_x, static_cast<double>(point.x));
         d_min_y = std::min(d_min_y, static_cast<double>(point.y));
         d_min_z = std::min(d_min_z, static_cast<double>(point.z));
@@ -231,6 +407,7 @@ void LOCALIZATION::buildTargetCells() {
                         bTC_mat3_d_cov += bTC_vt3_diff * bTC_vt3_diff.transpose();
                     }
                     bTC_mat3_d_cov /= static_cast<double>(cell_points.size() - 1);
+                    cell.stGauCell_mat3_d_cov = bTC_mat3_d_cov;
 
                     //분모 0 방지
                     double epsilon = 1e-6;
@@ -257,14 +434,222 @@ void LOCALIZATION::buildTargetCells() {
     }
 }
 
-
-// 정규화 상수 계산 함수
-void LOCALIZATION::computeNormalizationConstants() {
-    double cNC_d_gauss_c1 = (1 - m_cfg_f_outlier_ratio) / (sqrt((2 * M_PI)));
-    double cNC_d_gauss_c2 = m_cfg_f_outlier_ratio / (m_cfg_f_grid_size_m);
-    m_cfg_d_gauss_k1 = -log(cNC_d_gauss_c1);
-    m_cfg_d_gauss_k2 = -log(cNC_d_gauss_c2);
+static void convertTransform(const Eigen::Matrix<double, 6, 1>& x, Eigen::Affine3d& trans) {
+     trans = Eigen::Translation<Scalar, 3>(x.head<3>().cast<Scalar>()) *
+          Eigen::AngleAxis<Scalar>(static_cast<Scalar>(x(3)), Vector3::UnitX()) *
+          Eigen::AngleAxis<Scalar>(static_cast<Scalar>(x(4)), Vector3::UnitY()) *
+          Eigen::AngleAxis<Scalar>(static_cast<Scalar>(x(5)), Vector3::UnitZ());
 }
+
+
+inline double
+  auxilaryFunction_PsiMT(
+      double a, double f_a, double f_0, double g_0, double mu = 1.e-4)
+  {
+    return f_a - f_0 - mu * g_0 * a;
+  }
+
+inline double
+  auxilaryFunction_dPsiMT(double g_a, double g_0, double mu = 1.e-4)
+  {
+    return g_a - mu * g_0;
+  }
+
+double LOCALIZATION::trialValueSelectionMT(double a_l, double f_l, double g_l, double a_u, double f_u,
+                                    double g_u, double a_t, double f_t, double g_t) const
+{
+    if (a_t == a_l && a_t == a_u) {
+        return a_t;
+    }
+    const double epsilon = std::numeric_limits<double>::epsilon();
+
+    // Endpoints condition check [More, Thuente 1994], p.299 - 300
+    enum class EndpointsCondition { Case1, Case2, Case3, Case4 };
+    EndpointsCondition condition;
+
+    if (a_t == a_l) {
+        condition = EndpointsCondition::Case4;
+    }
+    else if (f_t > f_l) {
+        condition = EndpointsCondition::Case1;
+    }
+    else if (g_t * g_l < 0) {
+        condition = EndpointsCondition::Case2;
+    }
+    else if (std::fabs(g_t) <= std::fabs(g_l)) {
+        condition = EndpointsCondition::Case3;
+    }
+    else {
+        condition = EndpointsCondition::Case4;
+    }
+
+    switch (condition) {
+    case EndpointsCondition::Case1: {
+        // Calculate the minimizer of the cubic that interpolates f_l, f_t, g_l and g_t
+        // Equation 2.4.52 [Sun, Yuan 2006]
+        const double z = 3 * (f_t - f_l) / (a_t - a_l + epsilon) - g_t - g_l;
+        const double w = std::sqrt(std::max(0.0, z * z - g_t * g_l));
+        // Equation 2.4.56 [Sun, Yuan 2006]
+        const double a_c = a_l + (a_t - a_l + epsilon) * (w - g_l - z) / (g_t - g_l + 2 * w + epsilon);
+
+        // Calculate the minimizer of the quadratic that interpolates f_l, f_t and g_l
+        // Equation 2.4.2 [Sun, Yuan 2006]
+        const double a_q =
+            a_l - 0.5 * (a_l - a_t + epsilon) * g_l / (g_l - (f_l - f_t) / (a_l - a_t + epsilon) + epsilon);
+
+        if (std::fabs(a_c - a_l) < std::fabs(a_q - a_l)) {
+            return a_c;
+        }
+        return 0.5 * (a_q + a_c);
+    }
+
+    case EndpointsCondition::Case2: {
+        // Calculate the minimizer of the cubic that interpolates f_l, f_t, g_l and g_t
+        // Equation 2.4.52 [Sun, Yuan 2006]
+        const double z = 3 * (f_t - f_l) / (a_t - a_l + epsilon) - g_t - g_l;
+        const double w = std::sqrt(std::max(0.0, z * z - g_t * g_l));
+        // Equation 2.4.56 [Sun, Yuan 2006]
+        const double a_c = a_l + (a_t - a_l + epsilon) * (w - g_l - z) / (g_t - g_l + 2 * w + epsilon);
+
+        // Calculate the minimizer of the quadratic that interpolates f_l, g_l and g_t
+        // Equation 2.4.5 [Sun, Yuan 2006]
+        const double a_s = a_l - (a_l - a_t + epsilon) / (g_l - g_t + epsilon) * g_l;
+
+        if (std::fabs(a_c - a_t) >= std::fabs(a_s - a_t)) {
+            return a_c;
+        }
+        return a_s;
+    }
+
+    case EndpointsCondition::Case3: {
+        // Calculate the minimizer of the cubic that interpolates f_l, f_t, g_l and g_t
+        // Equation 2.4.52 [Sun, Yuan 2006]
+        const double z = 3 * (f_t - f_l) / (a_t - a_l + epsilon) - g_t - g_l;
+        const double w = std::sqrt(std::max(0.0, z * z - g_t * g_l));
+        const double a_c = a_l + (a_t - a_l + epsilon) * (w - g_l - z) / (g_t - g_l + 2 * w + epsilon);
+
+        // Calculate the minimizer of the quadratic that interpolates g_l and g_t
+        // Equation 2.4.5 [Sun, Yuan 2006]
+        const double a_s = a_l - (a_l - a_t + epsilon) / (g_l - g_t + epsilon) * g_l;
+
+        double a_t_next;
+
+        if (std::fabs(a_c - a_t) < std::fabs(a_s - a_t)) {
+            a_t_next = a_c;
+        }
+        else {
+            a_t_next = a_s;
+        }
+
+        if (a_t > a_l) {
+            return std::min(a_t + 0.66 * (a_u - a_t + epsilon), a_t_next);
+        }
+        return std::max(a_t + 0.66 * (a_u - a_t + epsilon), a_t_next);
+    }
+
+    default:
+    case EndpointsCondition::Case4: {
+        // Calculate the minimizer of the cubic that interpolates f_u, f_t, g_u and g_t
+        // Equation 2.4.52 [Sun, Yuan 2006]
+        const double z = 3 * (f_t - f_u) / (a_t - a_u + epsilon) - g_t - g_u;
+        const double w = std::sqrt(std::max(0.0, z * z - g_t * g_u));
+        // Equation 2.4.56 [Sun, Yuan 2006]
+        return a_u + (a_t - a_u + epsilon) * (w - g_u - z) / (g_t - g_u + 2 * w + epsilon);
+    }
+    }
+}
+
+bool LOCALIZATION::updateIntervalMT(double& a_l, double& f_l, double& g_l, double& a_u,
+    double& f_u, double& g_u, double a_t, double f_t, double g_t) const
+{
+    // Case U1 in Update Algorithm and Case a in Modified Update Algorithm [More, Thuente
+    // 1994]
+    if (f_t > f_l) {
+        a_u = a_t;
+        f_u = f_t;
+        g_u = g_t;
+        return false;
+    }
+    // Case U2 in Update Algorithm and Case b in Modified Update Algorithm [More, Thuente
+    // 1994]
+    if (g_t * (a_l - a_t) > 0) {
+        a_l = a_t;
+        f_l = f_t;
+        g_l = g_t;
+        return false;
+    }
+    // Case U3 in Update Algorithm and Case c in Modified Update Algorithm [More, Thuente
+    // 1994]
+    if (g_t * (a_l - a_t) < 0) {
+        a_u = a_l;
+        f_u = f_l;
+        g_u = g_l;
+
+        a_l = a_t;
+        f_l = f_t;
+        g_l = g_t;
+        return false;
+    }
+    // Interval Converged
+    return true;
+}
+
+
+void LOCALIZATION::computeHessian(Eigen::Matrix<double, 6, 6>& hessian, 
+                                  const pcl::PointCloud<pcl::PointXYZ>& trans_cloud) 
+{
+    hessian.setZero();
+    pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+    kdtree.setInputCloud(m_filtered_map->makeShared()); // KdTree에 포인트 클라우드 설정
+
+    for (std::size_t idx = 0; idx < inputed_source_points.size(); idx++) {
+        const auto& x_trans_pt = trans_cloud[idx];
+
+        //NaN 값 필터링
+        if (!pcl::isFinite(x_trans_pt)) {
+            std::cerr << "[WARNING] NaN or Inf value detected at index: " << idx << std::endl;
+            continue;  // 유효하지 않은 포인트는 건너뜁니다.
+        }
+
+        // 이웃 찾기
+        std::vector<int> pointIdxRadiusSearch;
+        std::vector<float> pointRadiusSquaredDistance;
+        double radius = m_cfg_f_grid_size_m;
+        double radius_squared = radius * radius;
+
+
+        if (kdtree.radiusSearch(x_trans_pt, radius, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0) {
+            for (std::size_t i = 0; i < pointIdxRadiusSearch.size(); ++i) {
+                if (pointRadiusSquaredDistance[i] <= radius_squared) {
+                    int neighbor_idx = pointIdxRadiusSearch[i];
+                    if (neighbor_idx < 0 || neighbor_idx >= m_vt_stGauCell_gaussian_cells.size()) {
+                        continue;  // 유효하지 않은 인덱스는 무시
+                    }
+                    const auto& cell = m_vt_stGauCell_gaussian_cells[neighbor_idx]; 
+
+                    const auto& x_pt = inputed_source_points[idx];
+                    Eigen::Vector3d x(x_pt.x, x_pt.y, x_pt.z);
+
+                    Eigen::Vector3d x_trans(x_trans_pt.x - cell.stGauCell_vt3_d_mean.x(),
+                                            x_trans_pt.y - cell.stGauCell_vt3_d_mean.y(),
+                                            x_trans_pt.z - cell.stGauCell_vt3_d_mean.z());
+
+                    // // 디버깅 로그 추가
+                    // std::cout << "Point Index: " << idx << ", Neighbor Index: " << neighbor_idx << std::endl;
+                    // std::cout << "Transformed Point: (" << x_trans_pt.x << ", " << x_trans_pt.y << ", " << x_trans_pt.z << ")" << std::endl;
+                    // std::cout << "Gaussian Cell Mean: (" << cell.stGauCell_vt3_d_mean.x() << ", " << cell.stGauCell_vt3_d_mean.y() << ", " << cell.stGauCell_vt3_d_mean.z() << ")" << std::endl;
+                    // std::cout << "Difference: (" << x_trans_pt.x << ", " << x_trans_pt.y << ", " << x_trans_pt.z << ")" << std::endl;
+                    
+                    const Eigen::Matrix3d& c_inv = cell.stGauCell_mat3_d_inv_cov;
+
+                    computePointDerivatives(x, true);
+                    updateHessian(hessian, x_trans, c_inv);
+                }
+            }
+        }
+    }
+}
+
 
 void LOCALIZATION::computeAngleDerivatives(const Eigen::Matrix<double, 6, 1>& transform, bool compute_hessian)
 {
@@ -348,6 +733,37 @@ void LOCALIZATION::computeAngleDerivatives(const Eigen::Matrix<double, 6, 1>& tr
     }
 }
 
+void LOCALIZATION::updateHessian(Eigen::Matrix<double, 6, 6>& hessian,
+                                 const Eigen::Vector3d& x_trans,
+                                 const Eigen::Matrix3d& c_inv) const
+{
+    // e^(-m_cfg_d_gauss_k2/2 * (x_k - mu_k)^T Sigma_k^-1 (x_k - mu_k)) Equation 6.9 [Magnusson 2009]
+    double e_x_cov_x = m_cfg_d_gauss_k2 * std::exp(-m_cfg_d_gauss_k2 * x_trans.dot(c_inv * x_trans) / 2000);
+
+    // Invalid value check
+    if (e_x_cov_x > 1 || e_x_cov_x < 0 || std::isnan(e_x_cov_x)) {
+        return;
+    }
+
+    // Reusable part of Equation 6.12 and 6.13 [Magnusson 2009]
+    e_x_cov_x *= m_cfg_d_gauss_k1;
+
+    for (int i = 0; i < 6; i++) {
+        // Sigma_k^-1 * d(T(x,p))/dpi, reusable part of Equation 6.12 and 6.13 [Magnusson 2009]
+        const Eigen::Vector3d cov_dxd_pi = c_inv * point_jacobian_.col(i);
+
+        for (int j = 0; j < 6; j++) {
+            // Update Hessian, Equation 6.13 [Magnusson 2009]
+            hessian(i, j) += e_x_cov_x * (-m_cfg_d_gauss_k2 * x_trans.dot(cov_dxd_pi) *
+                                             x_trans.dot(c_inv * point_jacobian_.col(j)) +
+                                         x_trans.dot(c_inv * point_hessian_.block<3, 1>(3 * i, j)) +
+                                         point_jacobian_.col(j).dot(cov_dxd_pi));
+        }
+    }
+}
+
+
+
 double LOCALIZATION::updateDerivatives(Eigen::Matrix<double, 6, 1>& score_gradient,
                                         Eigen::Matrix<double, 6, 6>& hessian,
                                         const Eigen::Vector3d& x_trans,
@@ -355,10 +771,10 @@ double LOCALIZATION::updateDerivatives(Eigen::Matrix<double, 6, 1>& score_gradie
                                         bool compute_hessian) const 
 {
     // 마할라노비스 거리 기반의 확률 계산 (Equation 6.9)
-    double e_x_cov_x = std::exp(-m_cfg_d_gauss_k2 * x_trans.dot(c_inv * x_trans) / 2);
+    double e_x_cov_x = m_cfg_d_gauss_k2 * std::exp(-m_cfg_d_gauss_k2 * x_trans.dot(c_inv * x_trans) / 2);;
     double score_inc = -m_cfg_d_gauss_k1 * e_x_cov_x;
 
-    e_x_cov_x *= m_cfg_d_gauss_k2;
+    //e_x_cov_x *= m_cfg_d_gauss_k2;
 
     // 유효성 검사로, e_x_cov_x가 올바른 범위에 있는지 확인합니다.
     if (e_x_cov_x > 1 || e_x_cov_x < 0 || std::isnan(e_x_cov_x)) {
@@ -371,7 +787,7 @@ double LOCALIZATION::updateDerivatives(Eigen::Matrix<double, 6, 1>& score_gradie
         Eigen::Vector3d cov_dxd_pi = c_inv * point_jacobian_.col(i); 
 
         // 그래디언트 업데이트 (Equation 6.12)
-        score_gradient(i) += x_trans.dot(cov_dxd_pi) * e_x_cov_x;
+        score_gradient(i) += x_trans.dot(cov_dxd_pi) * e_x_cov_x ;
 
         if (compute_hessian) {
             for (int j = i; j < 6; j++) {
@@ -390,19 +806,19 @@ double LOCALIZATION::updateDerivatives(Eigen::Matrix<double, 6, 1>& score_gradie
     return score_inc;
 }
 
-void LOCALIZATION::computePointDerivatives(const Eigen::Vector3d& x, Eigen::Matrix4d& transform_matrix, bool compute_hessian)
+void LOCALIZATION::computePointDerivatives(const Eigen::Vector3d& x, bool compute_hessian)
 {
     // Calculate first derivative of Transformation Equation 6.17 w.r.t. transform vector.
     // Derivative w.r.t. ith element of transform vector corresponds to column i,
     // Equation 6.18 and 6.19 [Magnusson 2009]
 
-    // 평행 이동 요소를 `point_jacobian_`에 추가
-    point_jacobian_.col(3).head<3>() = transform_matrix.block<3, 1>(0, 3);
-
     Eigen::Matrix<double, 8, 1> point_angular_jacobian =
         angular_jacobian_ * Eigen::Vector4d(x[0], x[1], x[2], 0.0);
     point_jacobian_.setZero();
-    point_jacobian_.block<3, 3>(0, 0) = transform_matrix.block<3, 3>(0, 0);
+
+    point_jacobian_(0, 0) = 1.0; // x 이동에 대한 파생 변수
+    point_jacobian_(1, 1) = 1.0; // y 이동에 대한 파생 변수
+    point_jacobian_(2, 2) = 1.0; // z 이동에 대한 파생 변수
 
     point_jacobian_(1, 3) = point_angular_jacobian[0];
     point_jacobian_(2, 3) = point_angular_jacobian[1];
@@ -444,53 +860,67 @@ void LOCALIZATION::computePointDerivatives(const Eigen::Vector3d& x, Eigen::Matr
 
 
 // 정합 스코어 및 그래디언트 계산 함수
-double LOCALIZATION::computeScoreAndGradient(Eigen::Matrix<double, 6, 1>& score_gradient,
-                                            Eigen::Matrix<double, 6, 6>& hessian,
-                                            const pcl::PointCloud<pcl::PointXYZ>& trans_cloud,
-                                            const Eigen::Matrix<double, 6, 1>& transform,
-                                            bool compute_hessian) 
+double LOCALIZATION::computeDerivatives(Eigen::Matrix<double, 6, 1>& score_gradient,
+                                        Eigen::Matrix<double, 6, 6>& hessian,
+                                        const pcl::PointCloud<pcl::PointXYZ>& trans_cloud,
+                                        const Eigen::Matrix<double, 6, 1>& transform,
+                                        bool compute_hessian) 
 {
-    // score_gradient.setZero();
-    // hessian.setZero();
-    double score = 0.0;
+    score_gradient.setZero();
+    hessian.setZero();
+    double score = 0;
 
-    // 변환 행렬을 4x4 행렬로 변환
-    Eigen::Matrix4d transform_matrix = computeTransformationMatrix(transform);
-
-    // 각 포인트에 대해 파라미터의 각도에 대한 파생 변수 계산
+    // 각도 파생 변수를 사전에 계산 (eq. 6.19 and 6.21) [Magnusson 2009]
     computeAngleDerivatives(transform);
 
-    // 각 포인트에 대해 업데이트
-    for (std::size_t idx = 0; idx < inputed_source_points.size(); idx++) {
-        const auto& point = inputed_source_points[idx];
-        Eigen::Vector4d p(static_cast<double>(point.x), static_cast<double>(point.y), static_cast<double>(point.z), 1.0);
+    double radius = m_cfg_f_grid_size_m;
+    double radius_squared = radius * radius;
 
-        // 변환 행렬과 곱셈
-        Eigen::Vector4d p_transformed = transform_matrix * p;
-        Eigen::Vector3d x_trans(p_transformed[0], p_transformed[1], p_transformed[2]);
+    // 모든 소스 포인트에 대해 구배와 헤시안 업데이트 (Algorithm 2, line 17)
+    for (std::size_t idx = 0; idx < inputed_source_points.size(); ++idx) {
+        // 변환된 포인트 가져오기
+        const auto& x_trans_pt = trans_cloud[idx];
+        Eigen::Vector3d x_trans_pt_vec(static_cast<double>(x_trans_pt.x), static_cast<double>(x_trans_pt.y), static_cast<double>(x_trans_pt.z));
 
-        // 근처의 셀(노이즈를 포함한 셀) 검색
-        double min_dist = std::numeric_limits<double>::max();
-        const GaussianCell* closest_cell = nullptr;
-
+        // 이웃 찾기 (radius 기반으로 직접 구현)
+        std::vector<GaussianCell> neighborhood;
         for (const auto& cell : m_vt_stGauCell_gaussian_cells) {
-            Eigen::Vector3d diff = x_trans - cell.stGauCell_vt3_d_mean;
-            double dist = diff.squaredNorm();
-            if (dist < min_dist) {
-                min_dist = dist;
-                closest_cell = &cell;
+            Eigen::Vector3d diff = x_trans_pt_vec - cell.stGauCell_vt3_d_mean;
+            double dist_squared = diff.squaredNorm();
+            if (dist_squared <= radius_squared) {
+                neighborhood.push_back(cell);
             }
         }
 
-        if (closest_cell) {
-            Eigen::Vector3d x_trans_mean = x_trans - closest_cell->stGauCell_vt3_d_mean;
-            Eigen::Matrix3d c_inv = closest_cell->stGauCell_mat3_d_inv_cov;
+        // 이웃에 대해 업데이트 수행
+        for (const auto& cell : neighborhood) {
+            // 원래 포인트
+            const auto& x_pt = inputed_source_points[idx];
+            Eigen::Vector3d x(static_cast<double>(x_pt.x), static_cast<double>(x_pt.y), static_cast<double>(x_pt.z));
 
-            // 파생 변수 계산
-            computePointDerivatives(Eigen::Vector3d(p[0], p[1], p[2]), transform_matrix, true);
+            // 변환된 점과 이웃 셀 평균의 차이
+            Eigen::Vector3d x_trans = x_trans_pt_vec - cell.stGauCell_vt3_d_mean;
 
-            // 스코어, 그래디언트, 헤시안 업데이트
-            score += updateDerivatives(score_gradient, hessian, x_trans_mean, c_inv, compute_hessian);
+           // 디버깅 로그 추가
+                    // std::cout << "Point Index: " << idx << ", Neighbor Index: " << neighbor_idx << std::endl;
+                    // std::cout << "Transformed Point: (" << x_trans_pt.x << ", " << x_trans_pt.y << ", " << x_trans_pt.z << ")" << std::endl;
+                    // std::cout << "Gaussian Cell Mean: (" << cell.stGauCell_vt3_d_mean.x() << ", " << cell.stGauCell_vt3_d_mean.y() << ", " << cell.stGauCell_vt3_d_mean.z() << ")" << std::endl;
+                    // std::cout << "Difference: (" << x_trans_pt.x << ", " << x_trans_pt.y << ", " << x_trans_pt.z << ")" << std::endl;
+                    
+
+            // 역 공분산 행렬 가져오기
+            const Eigen::Matrix3d& c_inv = cell.stGauCell_mat3_d_inv_cov;
+
+            // 변환 함수의 파생 변수 계산
+            computePointDerivatives(x, compute_hessian);
+
+            if (!pcl::isFinite(x_trans_pt)) {
+                std::cerr << "[WARNING] NaN or Inf value detected at index: " << idx << std::endl;
+                continue;  // 유효하지 않은 포인트는 건너뜁니다.
+            }
+
+            // 점수, 구배 및 헤시안 업데이트
+            score += updateDerivatives(score_gradient, hessian, x_trans, c_inv, compute_hessian);
         }
     }
 
@@ -499,123 +929,244 @@ double LOCALIZATION::computeScoreAndGradient(Eigen::Matrix<double, 6, 1>& score_
 
 
 
-Eigen::Matrix4d LOCALIZATION::computeTransformationMatrix(const Eigen::VectorXd& parameters) {
-    // 매개변수를 이용하여 변환 행렬 생성
-    //[DEBUG013] Parmeters : -2.11008, -0.254241, 6.8303, -18.6958, -6.26707, 5.93876,
-    double x = parameters[0];
-    double y = parameters[1];
-    double z = parameters[2];
 
-    double deg_to_rad = M_PI / 180.0;
-    double roll = parameters[3] * deg_to_rad;
-    double pitch = parameters[4] * deg_to_rad;
-    double yaw = parameters[5] * deg_to_rad;
+double LOCALIZATION::computeStepLengthMT(const Eigen::Matrix<double, 6, 1>& x,
+                                        Eigen::Matrix<double, 6, 1>& step_dir,
+                                        double step_init,
+                                        double step_max,
+                                        double step_min,
+                                        double& score,
+                                        Eigen::Matrix<double, 6, 1>& score_gradient,
+                                        Eigen::Matrix<double, 6, 6>& hessian,
+                                        pcl::PointCloud<pcl::PointXYZ>& trans_cloud) 
+{
 
-    Eigen::Matrix3d rotation;
-    rotation = Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()) *
-               Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()) *
-               Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ());
+    // // NaN 값 필터링
+    // if (!pcl::isFinite(trans_cloud)) {
+    //     std::cerr << "[WARNING] NaN index in computeStepLengthMT: "  << std::endl;
+    // }
 
-    Eigen::Matrix4d transformation = Eigen::Matrix4d::Identity();
-    transformation.block<3, 3>(0, 0) = rotation;  // 4x4행렬에서 상위 3x3행렬은 회전
-    transformation(0, 3) = x;  // 나머지 선형변환 행렬
-    transformation(1, 3) = y;
-    transformation(2, 3) = z;
+    const double phi_0 = -score;  // 초기 phi 값 설정 (Eq. 1.3 [More, Thuente 1994])
+    double d_phi_0 = -(score_gradient.dot(step_dir));  // 초기 phi' 값
 
-    return transformation;  // /home/ctu/LHS/approach/my_code/map_ws/my_ndt_4x4matrix.png
+    // 방향 확인
+    if (d_phi_0 >= 0) {
+        if (d_phi_0 == 0) return 0;
+        d_phi_0 *= -1;
+        step_dir *= -1;
+    }
+
+    // 설정 값
+    constexpr int max_step_iterations = 10;
+    int step_iterations = 0;
+    constexpr double mu = 1.e-4;
+    constexpr double nu = 0.9;
+
+    double a_l = 0, a_u = 0;  // 초기 간격 I 설정
+    bool interval_converged = (step_max - step_min) < 0, open_interval = true;
+
+    double a_t = step_init;
+    a_t = std::min(a_t, step_max);
+    a_t = std::max(a_t, step_min);
+
+    Eigen::Matrix<double, 6, 1> x_t = x + step_dir * a_t;
+
+    // 변환 적용
+    convertTransform(x_t, final_transformation_);
+
+    // 수정된 코드
+   // std::vector<pcl::PointXYZ>를 pcl::PointCloud<pcl::PointXYZ>로 변환
+    pcl::PointCloud<pcl::PointXYZ> pcl_inputed_source_points;
+    for (const auto& point : inputed_source_points) {
+        pcl_inputed_source_points.points.push_back(point);
+    }
+    pcl_inputed_source_points.width = pcl_inputed_source_points.points.size();
+    pcl_inputed_source_points.height = 1;
+    pcl_inputed_source_points.is_dense = true;
+
+    // 변환을 적용하기 위해 Affine3d를 Affine3f로 캐스팅
+    Eigen::Affine3f transformation_float = final_transformation_.cast<float>();
+
+    // 변환 적용
+    pcl::transformPointCloud(pcl_inputed_source_points, trans_cloud, transformation_float);
+
+    // 점수, 구배 및 헤시안 업데이트
+    score = computeDerivatives(score_gradient, hessian, trans_cloud, x_t, true);
+
+    double phi_t = -score;
+    double d_phi_t = -(score_gradient.dot(step_dir));
+    double psi_t = auxilaryFunction_PsiMT(a_t, phi_t, phi_0, d_phi_0, mu);
+    double d_psi_t = auxilaryFunction_dPsiMT(d_phi_t, d_phi_0, mu);
+
+    // 반복문
+    while (!interval_converged && step_iterations < max_step_iterations &&
+           (psi_t > 0 || d_phi_t > -nu * d_phi_0)) {
+        // 보조 함수 사용하여 구간이 닫힌 경우 업데이트
+        if (open_interval) {
+            a_t = trialValueSelectionMT(a_l, f_l, g_l, a_u, f_u, g_u, a_t, psi_t, d_psi_t);
+        } else {
+            a_t = trialValueSelectionMT(a_l, f_l, g_l, a_u, f_u, g_u, a_t, phi_t, d_phi_t);
+        }
+
+        a_t = std::min(a_t, step_max);
+        a_t = std::max(a_t, step_min);
+
+        x_t = x + step_dir * a_t;
+
+        // 변환 적용
+         convertTransform(x_t, final_transformation_); // 3번째에서 final_transformation_이 없음
+
+        // std::vector<pcl::PointXYZ>를 pcl::PointCloud<pcl::PointXYZ>로 변환
+        pcl::PointCloud<pcl::PointXYZ> pcl_inputed_source_points;
+        pcl_inputed_source_points.points.assign(inputed_source_points.begin(), inputed_source_points.end());
+
+        // 변환을 적용하기 위해 Affine3d를 Affine3f로 캐스팅
+        Eigen::Affine3f transformation_float = final_transformation_.cast<float>();
+
+        // 변환 적용
+        pcl::transformPointCloud(pcl_inputed_source_points, trans_cloud, transformation_float); // 버그발생
+
+
+        // 점수 및 구배 업데이트
+        score = computeDerivatives(score_gradient, hessian, trans_cloud, x_t, false);
+        phi_t = -score;
+        d_phi_t = -(score_gradient.dot(step_dir));
+
+        psi_t = auxilaryFunction_PsiMT(a_t, phi_t, phi_0, d_phi_0, mu);
+        d_psi_t = auxilaryFunction_dPsiMT(d_phi_t, d_phi_0, mu);
+
+        // 구간이 닫힌 경우 확인 후 업데이트
+        if (open_interval && (psi_t <= 0 && d_psi_t >= 0)) {
+            open_interval = false;
+            f_l += phi_0 - mu * d_phi_0 * a_l;
+            g_l += mu * d_phi_0;
+            f_u += phi_0 - mu * d_phi_0 * a_u;
+            g_u += mu * d_phi_0;
+        }
+
+        // 구간 경계 업데이트
+        if (open_interval) {
+            interval_converged = updateIntervalMT(a_l, f_l, g_l, a_u, f_u, g_u, a_t, psi_t, d_psi_t);
+        } else {
+            interval_converged = updateIntervalMT(a_l, f_l, g_l, a_u, f_u, g_u, a_t, phi_t, d_phi_t);
+        }
+
+        step_iterations++;
+    }
+
+    // 내부 루프가 실행된 경우, 다음 반복을 위해 헤시안 계산
+    if (step_iterations) {
+        computeHessian(hessian, trans_cloud);
+    }
+
+    return a_t;
 }
 
-
-
-Eigen::VectorXd LOCALIZATION::computeParameters(const Eigen::Matrix4d& transformation) {
-    // 변환 행렬에서 매개변수 추출
-    Eigen::Matrix<double, 6, 1> parameters;
-
-    parameters[0] = transformation(0, 3); // x
-    parameters[1] = transformation(1, 3); // y
-    parameters[2] = transformation(2, 3); // z
-
-    // 회전 행렬에서 roll, pitch, yaw 추출
-    Eigen::Matrix3d rotation = transformation.block<3, 3>(0, 0);
-    Eigen::Vector3d euler_angles = rotation.eulerAngles(0, 1, 2);
-
-    parameters[3] = euler_angles[0]; // roll
-    parameters[4] = euler_angles[1]; // pitch
-    parameters[5] = euler_angles[2]; // yaw
-
-    return parameters;  // x, y, z, roll, pitch, yaw
-}
 
 
 // 정합함수
-void LOCALIZATION::align(Eigen::Matrix4d& m_matrix4d_initial_esti) {
-    // 초기 파라미터를 추출합니다.
-    Eigen::Matrix<double, 6, 1> parameters = computeParameters(m_matrix4d_initial_esti);
+void LOCALIZATION::align(Eigen::Matrix4d& m_matrix4d_initial_esti, pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_input_cloud) {
+    
+    nr_iterations_ = 0;
+    converged_ = false;
+     pcl::PointCloud<pcl::PointXYZ> output = *filtered_input_cloud;
+    
+    // //타겟 클라우드가 비어 있는지 확인
+    // if (target_cells_.getCentroids()->empty()) {
+    //     std::cerr << "[ERROR] Target Voxel grid is not searchable!" << std::endl;
+    //     return;
+    // }
 
-    // 매개변수 크기 확인
-    if (parameters.size() != 6) {
-        std::cerr << "[ERROR] parameters size is not 6." << std::endl;
-        return;
+    // 가우시안 피팅 파라미터 초기화 (eq. 6.8) [Magnusson 2009]
+    const double gauss_c1 = 10 * (1 - outlier_ratio_);
+    const double gauss_c2 = outlier_ratio_ / std::pow(m_cfg_f_grid_size_m, 3);
+    const double gauss_d3 = -std::log(gauss_c2);
+    m_cfg_d_gauss_k1 = -std::log(gauss_c1 + gauss_c2) - gauss_d3;
+    m_cfg_d_gauss_k2 = -2 * std::log((-std::log(gauss_c1 * std::exp(-0.5) + gauss_c2) - gauss_d3) / m_cfg_d_gauss_k1);
+
+    // 초기 추정치 확인 후 적용
+    Eigen::Matrix4d transformation = m_matrix4d_initial_esti;
+    if (transformation != Eigen::Matrix4d::Identity()) {
+        final_transformation_ = transformation;
+        transformPointCloud(output, output, transformation);
     }
 
+    // 초기화: 구배와 헤시안
+    Eigen::Matrix<double, 6, 1> transform, score_gradient;
+    Eigen::Matrix<double, 6, 6> hessian;
+    score_gradient.setZero();
+    hessian.setZero();
 
-    // inputed_source_points를 pcl::PointCloud로 변환
-    pcl::PointCloud<pcl::PointXYZ> trans_cloud;
-    trans_cloud.points.assign(inputed_source_points.begin(), inputed_source_points.end());
+    Eigen::Matrix4d final_matrix = final_transformation_.matrix();
+    Eigen::Vector3d init_translation = final_matrix.block<3, 1>(0, 3);
+    Eigen::Vector3d init_rotation = final_matrix.block<3, 3>(0, 0).eulerAngles(0, 1, 2);
 
-    for (int iter = 0; iter < m_cfg_int_iterate_max; ++iter) {
-        // 그래디언트와 헤시안을 초기화합니다.
-        Eigen::Matrix<double, 6, 1> score_gradient = Eigen::Matrix<double, 6, 1>::Zero();
-        Eigen::Matrix<double, 6, 6> hessian = Eigen::Matrix<double, 6, 6>::Zero();
+    // Eigen::Vector3d init_translation = final_transformation_.block<3, 1>(0, 3);  Affine3d수정
+    // Eigen::Vector3d init_rotation = final_transformation_.block<3, 3>(0, 0).eulerAngles(0, 1, 2);
+    transform << init_translation, init_rotation;
 
-        // 스코어를 계산하고, 그래디언트와 헤시안을 업데이트합니다.
-        double score = computeScoreAndGradient(score_gradient, hessian, trans_cloud, parameters);
+    double score = computeDerivatives(score_gradient, hessian, output, transform, true);
 
-        if (m_cfg_b_debug_mode==false) {
-            std::cout << "[DEBUG] Score at iteration " << iter << ": " << score << std::endl;
-            std::cout << "[DEBUG033] Parameters: " 
-              << parameters[0] << "," << parameters[1] << "," << parameters[2] << std::endl;
-              //","              << parameters[3] << "," << parameters[4] << "," << parameters[5] << std::endl;
+    while (!converged_) {
+        // 이전 변환 저장
+        previous_transformation_ = transformation;
+
+        // 뉴턴 방법으로 방향 찾기 (Algorithm 2, [Magnusson 2009])
+        Eigen::JacobiSVD<Eigen::Matrix<double, 6, 6>> sv(hessian, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix<double, 6, 1> delta = sv.solve(-score_gradient);
+
+        // 스텝 길이 계산 [More, Thuente 1994]
+        double delta_norm = delta.norm();
+        if (delta_norm == 0 || std::isnan(delta_norm)) {
+            trans_likelihood_ = score / static_cast<double>(inputed_source_points.size());
+            converged_ = delta_norm == 0;
+            return;
         }
 
-        // 그래디언트의 노름을 계산하여 확인합니다.
-        double gradient_norm = score_gradient.norm();
-        if (std::isnan(gradient_norm) || std::isinf(gradient_norm)) {
-            std::cerr << "[ERROR] Gradient norm is invalid at iteration " << iter << std::endl;
-            break;
-        }
+        delta /= delta_norm + 1e-6;
+        delta_norm = computeStepLengthMT(transform, delta, delta_norm, m_cfg_f_step_size_m, m_cfg_d_trans_error_allow / 2, score, score_gradient, hessian, output);
+        delta *= delta_norm;
 
-        // 그래디언트 클리핑: 큰 값이 나올 경우 조정합니다.
-        const double gradient_max_norm = 1000.0;
-        if (gradient_norm > gradient_max_norm) {
-            score_gradient *= (gradient_max_norm / gradient_norm);
-            if (m_cfg_b_debug_mode) {
-                std::cout << "[DEBUG] Gradient clipped at iteration " << iter << ":" << gradient_norm << std::endl;
-            }
-        }
-
-        // 헤시안이 양의 정부호인지 확인하고, 선형 시스템을 해결합니다.
-        Eigen::Matrix<double, 6, 6> hessian_norm = hessian;
-        Eigen::Matrix<double, 6, 1> delta = hessian_norm.ldlt().solve(-score_gradient);
-
-        // 파라미터 업데이트: 스텝 사이즈 조정 (라인 검색 또는 고정 스텝)
-        double step_size = 0.5 * (1.0 / (1.0 + iter));//m_cfg_f_step_size_m;
-        parameters += step_size * delta;
-
-        if (m_cfg_b_debug_mode) {
-            std::cout << "[DEBUG] Updated parameters at iteration " << iter << ": " << parameters.transpose() << std::endl;
-        }
-
-        // 변환 행렬 업데이트
-        m_matrix4d_initial_esti = computeTransformationMatrix(parameters);
+        // 행렬 변환
+        //convertTransform(delta, transformation_);
+        transform += delta;
 
 
-        if (abs(score) < 0.001 ) {
-            std::cout << "Converged at iteration: " << iter << std::endl;
-            break;
+        // 변환 행렬을 업데이트된 transform에서 계산
+        Eigen::Affine3d transformation_affine;
+        transformation_affine.translation() = transform.head<3>();
+        transformation_affine.linear() = (Eigen::AngleAxisd(transform[3], Eigen::Vector3d::UnitX()) *
+                                          Eigen::AngleAxisd(transform[4], Eigen::Vector3d::UnitY()) *
+                                          Eigen::AngleAxisd(transform[5], Eigen::Vector3d::UnitZ())).toRotationMatrix();
+        transformation = transformation_affine.matrix();
+
+        // 포인트 클라우드에 업데이트된 변환 적용
+        transformPointCloud(*filtered_input_cloud, output, transformation);
+
+        // 구배 및 헤시안 재계산
+        score = computeDerivatives(score_gradient, hessian, output, transform, true);
+
+        // 회전 각도와 이동 크기 계산
+        const double cos_angle = 0.5 * (transformation.block<3, 3>(0, 0).trace() - 1);
+        const double translation_sqr = transformation.block<3, 1>(0, 3).squaredNorm();
+
+        //std::cout << nr_iterations_ << std::endl;
+
+        nr_iterations_++;
+
+        // 수렴 조건 확인
+        if (nr_iterations_ >= m_cfg_int_iterate_max ||
+            ((m_cfg_d_trans_error_allow > 0 && translation_sqr <= m_cfg_d_trans_error_allow) &&
+             (m_cfg_d_rot_error_allow > 0 && cos_angle >= m_cfg_d_rot_error_allow)) ||
+            ((m_cfg_d_trans_error_allow <= 0) && (m_cfg_d_rot_error_allow > 0 && cos_angle >= m_cfg_d_rot_error_allow)) ||
+            ((m_cfg_d_trans_error_allow > 0 && translation_sqr <= m_cfg_d_trans_error_allow) && (m_cfg_d_rot_error_allow <= 0))) {
+            converged_ = true;
         }
     }
 
+    // 최종 변환 가능성 저장
+    trans_likelihood_ = score / static_cast<double>(inputed_source_points.size());
+    m_matrix4d_initial_esti = transformation;
 }
 
 
@@ -715,6 +1266,7 @@ void LOCALIZATION::ProcessNDT(const sensor_msgs::PointCloud2ConstPtr& msg)
     crop_box_filter.setMax(tar_max_point.cast<float>());
     crop_box_filter.filter(*filtered_map);
     PublishPointCloud(filtered_map, m_ros_filtered_map_pub, "velo_link");
+    m_filtered_map = filtered_map;
 
     // Input Scan data 필터링 및 크기 제한
     pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_input_cloud(new pcl::PointCloud<pcl::PointXYZ>());
@@ -734,28 +1286,117 @@ void LOCALIZATION::ProcessNDT(const sensor_msgs::PointCloud2ConstPtr& msg)
     
     std::cout << "[DEBUG002] filtered_map size: " << filtered_map->points.size() << std::endl;
 
-    LOCALIZATION::setInputTarget(LOCALIZATION::convertToPointVector(filtered_map));
-    LOCALIZATION::setInputSource(LOCALIZATION::convertToPointVector(filtered_input_cloud));
+    // LOCALIZATION::setInputTarget(LOCALIZATION::convertToPointVector(filtered_map));
+    // LOCALIZATION::setInputSource(LOCALIZATION::convertToPointVector(filtered_input_cloud));
+
+    LOCALIZATION::setInputTarget(filtered_map);
+    LOCALIZATION::setInputSource(filtered_input_cloud);
 
 
-    // NDT 시작
-    std::cout << "[DEBUG_005] NDT 정렬 시작..." << std::endl;
+    // // NDT 시작
+    // std::cout << "[DEBUG_005] NDT 정렬 시작..." << std::endl;
     
 
     // NDT 정렬 수행
     std::cout << "[DEBUG_011] 초기 추정치" << "(" << m_matrix4d_initial_esti(0,3) << ",      " << 
         m_matrix4d_initial_esti(1,3) << ",      "<< m_matrix4d_initial_esti(2,3) << ")" << std::endl;
 
-    // 정합 수행
-    LOCALIZATION::align(m_matrix4d_initial_esti); // 초기 추정치 사용
+
+
+    Eigen::Matrix4d m_matrix4d_prev2 = Eigen::Matrix4d::Identity(); // t-2를 저장할 행렬
+    Eigen::Matrix4d m_matrix4d_prev1 = Eigen::Matrix4d::Identity(); // t-1을 저장할 행렬
+
+    // 초기 추정치 계산 (선형 예측 모델)
+    if (ndt_iter > 2) {
+        // t-2, t-1, t의 행렬을 이용하여 t+1의 초기 추정치를 계산합니다.
+        
+        // 이전 단계에서의 변환 계산
+        Eigen::Matrix4d delta_prev = m_matrix4d_prev1 * m_matrix4d_prev2.inverse();
+        Eigen::Matrix4d delta_curr = m_matrix4d_initial_esti * m_matrix4d_prev1.inverse();
+
+        // 두 변환 행렬의 평균을 사용하여 다음 변환 예측
+        Eigen::Matrix4d delta_mean = (delta_prev + delta_curr) / 2.0;
+
+        // 다음 단계의 변환 예측
+        Eigen::Matrix4d m_matrix4d_predict = m_matrix4d_initial_esti * delta_mean;
+
+        // m_matrix4d_prev2, m_matrix4d_prev1 갱신
+        m_matrix4d_prev2 = m_matrix4d_prev1;
+        m_matrix4d_prev1 = m_matrix4d_initial_esti;
+
+        // 예측된 위치를 포인트 클라우드로 변환
+        pcl::PointXYZ predict_position;
+        predict_position.x = m_matrix4d_predict(0, 3);
+        predict_position.y = m_matrix4d_predict(1, 3);
+        predict_position.z = m_matrix4d_predict(2, 3);
+
+        // 이전 포인트 클라우드 초기화하고 새로운 예측 포인트 추가
+        m_pc_predict_cloud->clear();
+        m_pc_predict_cloud->points.push_back(predict_position);
+
+        // 퍼블리시
+        PublishPointCloud(m_pc_predict_cloud, m_ros_predict_pub, "velo_link");
+
+        // align 함수 호출 (예측된 변환 행렬 사용)
+        LOCALIZATION::align(m_matrix4d_predict, filtered_input_cloud);
+
+    } else if (ndt_iter > 1) {
+        // t-1과 t의 행렬을 이용하여 초기 추정치를 계산합니다.
+        Eigen::Matrix4d delta_init = m_matrix4d_initial_esti * m_matrix4d_prev1.inverse();
+        Eigen::Matrix4d m_matrix4d_predict = m_matrix4d_initial_esti * delta_init;
+
+        // m_matrix4d_prev1 갱신
+        m_matrix4d_prev2 = m_matrix4d_prev1;
+        m_matrix4d_prev1 = m_matrix4d_initial_esti;
+
+        // 예측된 위치를 포인트 클라우드로 변환
+        pcl::PointXYZ predict_position;
+        predict_position.x = m_matrix4d_predict(0, 3);
+        predict_position.y = m_matrix4d_predict(1, 3);
+        predict_position.z = m_matrix4d_predict(2, 3);
+
+        // 이전 포인트 클라우드 초기화하고 새로운 예측 포인트 추가
+        m_pc_predict_cloud->clear();
+        m_pc_predict_cloud->points.push_back(predict_position);
+
+        // 퍼블리시
+        PublishPointCloud(m_pc_predict_cloud, m_ros_predict_pub, "velo_link");
+
+        // align 함수 호출 (예측된 변환 행렬 사용)
+        LOCALIZATION::align(m_matrix4d_predict, filtered_input_cloud);
+
+    } else {
+        // 첫 씬일 경우 Identity 행렬 사용
+        m_matrix4d_prev1 = m_matrix4d_initial_esti;
+
+        LOCALIZATION::align(m_matrix4d_initial_esti, filtered_input_cloud);
+    }
+
+    // ndt_iter
+    ndt_iter++;
+
+
+    // ---------------------------정합 수행------------------------------------------------
+    //LOCALIZATION::align(m_matrix4d_initial_esti, filtered_input_cloud); // 초기 추정치 사용
     std::cout << "[DEBUG_006] NDT 정렬 끝..." << std::endl;
 
     // 정합된 포인트 클라우드 생성
     pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    for (const auto& point : filtered_input_cloud->points) {
+        input_cloud->points.push_back(point);
+    }
     pcl::transformPointCloud(*filtered_input_cloud, *aligned_cloud, m_matrix4d_initial_esti);
 
+    pcl::PointXYZ curr_pose_data;
+    curr_pose_data.x = m_vt_f_44_poses[m_pose_num][0][3];
+    curr_pose_data.y = m_vt_f_44_poses[m_pose_num][1][3];
+    curr_pose_data.z = m_vt_f_44_poses[m_pose_num][2][3];
+
+    std::cout << m_pose_num <<" 번째 실제 Pose : (" << curr_pose_data.x << ",       " <<
+     curr_pose_data.y << ",           " << curr_pose_data.z << ")" << std::endl;
+
     // NDT 정렬 수행
-    std::cout << "[DEBUG_012] aligned 추정치" << "(" << m_matrix4d_initial_esti(0,3) << ",      " << 
+    std::cout << "[DEBUG_012] aligned 추정치 : " << "(" << m_matrix4d_initial_esti(0,3) << ",      " << 
         m_matrix4d_initial_esti(1,3) << ",      "<< m_matrix4d_initial_esti(2,3) << ")" << std::endl;
 
 
@@ -766,6 +1407,12 @@ void LOCALIZATION::ProcessNDT(const sensor_msgs::PointCloud2ConstPtr& msg)
     current_position.z = m_matrix4d_initial_esti(2, 3);
     m_pc_trajectory_cloud->points.push_back(current_position);
 
+    // 실제Pose - aligned 추정치 Pose -> MAE 
+    std::cout << " XYZ좌표 오차 평균 : " << (abs(curr_pose_data.x-current_position.x)+abs(curr_pose_data.y-current_position.y)+abs(curr_pose_data.z-current_position.z))/3 << std::endl;
+    std::cout << " X좌표 오차 : " << abs(curr_pose_data.x-current_position.x) << std::endl;
+    std::cout << " Y좌표 오차 : " << abs(curr_pose_data.y-current_position.y) << std::endl;
+    std::cout << " Z좌표 오차 : " << abs(curr_pose_data.z-current_position.z) << std::endl;
+
     // 누적된 포인트 클라우드를 퍼블리시
     PublishPointCloud(m_pc_trajectory_cloud, m_ros_trajectory_pub, "velo_link");
     // 정합 결과 퍼블리시
@@ -773,6 +1420,8 @@ void LOCALIZATION::ProcessNDT(const sensor_msgs::PointCloud2ConstPtr& msg)
 
     // // Marker 퍼블리시
     // publishMarker(m_matrix4d_initial_esti, quat);
+
+    m_pose_num++;
 
 }
 
