@@ -26,6 +26,9 @@ struct GaussianCell {
     Eigen::Matrix3d stGauCell_mat3d_cov;         // 공분산 행렬
     Eigen::Matrix3d stGauCell_mat3d_inv_cov; // 공분산 행렬의 역행렬
     double stGauCell_d_det;                 // 공분산 행렬의 행렬식
+
+    Eigen::Vector3d getMean() const { return stGauCell_vec3d_mean; }
+    Eigen::Matrix3d getInverseCov() const { return stGauCell_mat3d_inv_cov; }
 };
 
 
@@ -66,14 +69,15 @@ public:
     pcl::PointCloud<pcl::PointXYZ>::Ptr m_pcl_map_cloud;
     ros::Publisher m_ros_map_pub;
 
+    std::vector<GaussianCell> m_vec_stGauCell_gaussian_cells;
+
 private:
     bool m_b_debugmode;
     uint32_t m_cfg_uint32_message_count = 0;
 
     // 파라미터
+    float m_f_radius_m;
     float m_cfg_f_grid_size_m;
-
-    std::vector<GaussianCell> m_vec_stGauCell_gaussian_cells;
 
     //백그라운드 쓰레드
     std::queue<sensor_msgs::PointCloud2ConstPtr> m_std_lidar_data_queue;
@@ -89,7 +93,9 @@ private:
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr m_pcl_filtered_map_ptr;
     ros::Publisher m_ros_filtered_map_pub;
-    
+    ros::Publisher m_ros_filtered_input_pub;
+
+    ros::Subscriber m_ros_point_cloud_sub;
     
     
 

@@ -8,6 +8,7 @@
 #include <pcl/filters/filter.h> // NaN 제거
 #include <pcl/filters/extract_indices.h> // 필터링
 #include <pcl/common/common.h> // PointCloud 처리
+#include <pcl/filters/voxel_grid.h>  // VoxelGrid
 
 
 // 클래스 생성
@@ -19,12 +20,21 @@ LOCALIZATION::LOCALIZATION(ros::NodeHandle& nh) {
 
     m_b_debugmode = false;
 
+    m_f_radius_m = 20.0; // 필터링할 반경 (단위: 미터)
     m_cfg_f_grid_size_m = 2.0;
 
     m_matrix4d_initial_esti = Eigen::Matrix4d::Identity();
-
+    
+    // 퍼플리쉬 설정
     m_ros_map_pub = nh.advertise<sensor_msgs::PointCloud2>("map_cloud", 1);
     m_ros_filtered_map_pub = nh.advertise<sensor_msgs::PointCloud2>("filtered_map_cloud", 1);
+    m_ros_filtered_input_pub = nh.advertise<sensor_msgs::PointCloud2>("filtered_input_cloud", 1);
+
+    // 서브스크라이버 설정
+    m_ros_point_cloud_sub = nh.subscribe("/kitti/velo/pointcloud", 1, &LOCALIZATION::NDTCallback, this);
+
+    // 초기 타겟 포인트
+    setInputTarget(convertToPointVector(m_pcl_map_cloud));
 }
 
 LOCALIZATION::~LOCALIZATION() {
@@ -239,13 +249,12 @@ void FilterPointCloudBySphere(
 
         if (std::abs(point.x - center[0]) > radius) continue;
         if (std::abs(point.y - center[1]) > radius) continue;
-        if (std::abs(point.z - center[2]) > radius) continue;
 
-        // 최종적으로 구 형태를 확인
         float dx = point.x - center[0];
         float dy = point.y - center[1];
-        float dz = point.z - center[2];
 
+        if (dx * dx + dy * dy > radius*radius) continue;
+        
         inliers->indices.push_back(i);
     }
 
@@ -312,8 +321,7 @@ void LOCALIZATION::ProcessNDT(const sensor_msgs::PointCloud2ConstPtr& msg)
     pcl::fromROSMsg(*msg, *input_cloud);
 
     // target Map 구형태로 필터링
-    float radius = 25.0; // 필터링할 반경 (단위: 미터)
-    Eigen::Vector3f center(m_matrix4d_initial_esti(0, 3),
+    Eigen::Vector3f map_center(m_matrix4d_initial_esti(0, 3),
                         m_matrix4d_initial_esti(1, 3),
                         m_matrix4d_initial_esti(2, 3));
 
@@ -323,12 +331,28 @@ void LOCALIZATION::ProcessNDT(const sensor_msgs::PointCloud2ConstPtr& msg)
     }
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_map(new pcl::PointCloud<pcl::PointXYZ>());
-    FilterPointCloudBySphere(m_pcl_map_cloud, filtered_map, center, radius);
+    FilterPointCloudBySphere(m_pcl_map_cloud, filtered_map, map_center, m_f_radius_m + 2.0);
     if(m_b_debugmode){
         std::cout << "filtered_map size : " << filtered_map->size() << std::endl;
     }
     PublishPointCloud(filtered_map, m_ros_filtered_map_pub, "velo_link");
     m_pcl_filtered_map_ptr = filtered_map;
+
+    // Input Scan data 필터링 및 크기 제한
+    pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_input_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    //pcl::ApproximateVoxelGrid<pcl::PointXYZ> voxel_grid_filter;
+    pcl::VoxelGrid<pcl::PointXYZ> voxel_grid_filter;
+    voxel_grid_filter.setLeafSize(1.5, 1.5, 1.5);  // 다운샘플링 1.0
+    voxel_grid_filter.setInputCloud(input_cloud);
+    voxel_grid_filter.filter(*filtered_input_cloud);
+
+    Eigen::Vector3f input_center(0, 0, 0);
+
+    FilterPointCloudBySphere(filtered_input_cloud, filtered_input_cloud, input_center, m_f_radius_m);
+    PublishPointCloud(filtered_input_cloud, m_ros_filtered_input_pub, "velo_link");
+
+    LOCALIZATION::setInputTarget(filtered_map);
+    LOCALIZATION::setInputSource(filtered_input_cloud);
 
 
 }
